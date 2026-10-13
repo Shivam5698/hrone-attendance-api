@@ -10,18 +10,20 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone,time
-from typing import Optional
+from typing import Optional,Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from fastapi import FastAPI, HTTPException,Query
+from pydantic import BaseModel,Field,StrictInt
+from pymongo import MongoClient,ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"),tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
+db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -74,9 +76,12 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[StrictInt] = Field(None, ge=100000000000, le=4102444800000)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
+class PunchOutIn(BaseModel):
+    emp_code:str
+    punched_at:Optional[StrictInt]=Field(None, ge=100000000000, le=4102444800000)
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -98,23 +103,30 @@ def create_employee(body: EmployeeIn):
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+      page: int =Query(1,ge=1),
+      page_size: int=Query(20,ge=1,le=100),
+):
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page-1) * page_size
+    total = db.employees.count_documents(q)
+    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code",1).skip(skip).limit(page_size))
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
+    if not emp:
+        raise HTTPException(404,"employee not found") 
+    ts = (datetime.fromtimestamp(body.punched_at / 1000,tz=IST)
+    if body.punched_at is not None
+    else datetime.now(IST)
+    ).replace(microsecond=0)
     d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -127,11 +139,62 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
+    try:
+        res = db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409,"already punched in for this date")
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
+    doc["punch_in"]=int(ts.timestamp()*1000)
     return doc
 
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp=db.employees.find_one({"emp_code":body.emp_code})
+    if not emp:
+        raise HTTPException(404,"employee not found")
+
+    ts=(
+        datetime.fromtimestamp(body.punched_at/1000,tz=IST)
+        if body.punched_at is not None
+        else datetime.now(IST)
+    ).replace(microsecond=0)
+
+    rec=db.attendance_logs.find_one(
+        {"emp_code":body.emp_code,"punch_in":{"$lte":ts}},
+        sort=[("punch_in",-1)],
+    )
+
+    if not rec:
+        raise HTTPException(404,"no punch-in found")
+    if rec["punch_out"] is not None:
+        raise HTTPException(409,"already punched out")
+
+    if ts<=rec["punch_in"] or (ts-rec["punch_in"])>timedelta(hours=24):
+            raise HTTPException(422,"punched_at must be after punch in and  within 24 hours")
+    work_hours=compute_work_hours(rec["punch_in"],ts)
+    overtime=compute_overtime(ts,emp["shift_end"],emp["shift_start"],rec["date"])
+    half_day=work_hours<4.5
+
+    updated=db.attendance_logs.find_one_and_update(
+        {"_id":rec["_id"],"punch_out":None},
+        {"$set": {
+            "punch_out":ts,
+            "work_hours":work_hours,
+            "overtime_minutes":overtime,
+            "half_day":half_day,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        raise HTTPException(409,"already punched out")
+
+    updated["id"]=str(updated.pop("_id"))
+    updated["punch_in"]=int(updated["punch_in"].timestamp()*1000)
+    updated["punch_out"]=int(updated["punch_out"].timestamp()*1000)
+    return updated
 
 @app.get("/attendance")
 def list_attendance(
