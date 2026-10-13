@@ -9,13 +9,14 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone,time
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from decimal import Decimal, ROUND_HALF_UP
 
 load_dotenv()
 
@@ -34,18 +35,29 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
     minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    second=int((punch_in - start).total_seconds())
+    return minutes if second>600 else 0
 
 
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+def compute_work_hours(punch_in: datetime, punch_out: datetime) ->float:
+    hours=(punch_out - punch_in).total_seconds()/3600
+    d_hours = Decimal(str(hours)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(d_hours)
 
-
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
-
+def compute_overtime(punch_out: datetime, shift_end: str,shift_start:str, date_str: str) -> int:
+    sh, sm = map(int, shift_start.split(":"))
+    eh,em=map(int,shift_end.split(":"))
+    start_total = sh * 60 + sm
+    end_total =eh * 60 + em
+    attendance_date = datetime.fromisoformat(date_str).date()
+    if end_total <= start_total:
+        end_date = attendance_date + timedelta(days=1)
+    else:
+        end_date = attendance_date
+    end_dt = datetime.combine(end_date, time(eh, em), tzinfo=IST)
+    punch_out_clean = punch_out.replace(microsecond=0)
+    minutes = max(0, int((punch_out_clean - end_dt).total_seconds() / 60))
+    return minutes if minutes >= 30 else 0
 
 # --------------------------------------------------------------------------- #
 # Models
