@@ -9,11 +9,14 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
+import json
+import re
+from bson import json_util
 from datetime import datetime, timedelta, timezone,time
 from typing import Optional,Literal
-import calendar
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException,Query
+from fastapi import FastAPI, HTTPException,Query,Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from pymongo import MongoClient,ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -167,6 +170,33 @@ def employee_monthly_pipeline(emp_code:str,month:str)->list:
             "total_overtime_minutes":{"$sum":{"$ifNull":["$overtime_minutes",0]}},
         }},
     ]
+
+STATUS_VALUES=("PRESENT","WFh","ON_DUTY","ABSENT","LEAVE")
+
+def attendance_filter(emp_code,date_from,date_to,status)->dict:
+    q={}
+    if emp_code:
+        q["emp_code"]=emp_code
+    if date_from or date_to:
+        q["date"]={}
+        if date_from:
+            q["date"]["$gte"]=date_from
+        if date_to:
+            q["date"]["$lte"]=date_to
+    if status:
+        q["status"]=status
+    return q
+
+def int_param(params,name:str,default:int,low:int,high:int)->int:
+    try:
+        value=int(params.get(name,default))
+    except ValueError:
+        raise HTTPException(422,f"{name} must be an integer")
+    if not low<=value <=high:
+        raise HTTPException(422,f"{name} must be between {low} and {high}")
+    return value
+
+
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -412,17 +442,7 @@ def list_attendance(
     if date_from and date_to and date_from>date_to:
         raise HTTPException(422,"date_from must not be after date_to")
     
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
+    q=attendance_filter(emp_code,date_from,date_to,status)
 
     total=db.attendance_logs.count_documents(q)
     cursor=(
@@ -467,6 +487,51 @@ def employee_monthly(
         "total_overtime_minutes":r.get("total_ovetime_minutes",0),
         "attendance_pct":attendance_pct,
     }
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint:Literal["attendance_list","employee_monthly","department_summary","late_leaderboard","department_trend"],\
+    request:Request,
+):
+    p=request.query_params
+
+    if endpoint=="attendance_list":
+        date_from,date_to,status=p.get("date_from"),p.get("date_to"),p.get("status")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422,"date_from must not be after date_to")
+        if status and status not in STATUS_VALUES:
+            raise HTTPException(422,"invalid status")
+        page=int_param(p,"page",1,1,10**9)
+        page_size=int_param(p,"page_size",20,1,100)
+        collection="attendance_logs"
+
+        cmd={
+            "find":collection,
+            "filter":attendance_filter(p.get("emp_code"),date_from,date_to,status),
+            "sort":{"date":-1,"emp_code":1},
+            "skip":(page-1)*page_size,
+            "limit":page_size,
+        }
+    elif endpoint=="employee_monthly":
+        emp_code,month=p.get("emp_code"),p.get("month")
+        if not emp_code or not month or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])",month):
+            raise HTTPException(422,"emp_code and month (YYYY-MM) are required")
+        collection="attendance_logs"
+        cmd={
+            "aggregate":collection,
+            "pipeline":employee_monthly_pipeline(emp_code,month),
+            "cursor":{},
+        }
+    else:
+        raise HTTPException(501,f"explain for {endpoint} is not implemented")
+    result = db.command({"explain": cmd, "verbosity": "executionStats"})
+    return{
+        "endpoint":endpoint,
+        "collection":collection,
+        "explain":json.loads(json_util.dumps(result)),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
