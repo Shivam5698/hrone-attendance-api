@@ -11,10 +11,10 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone,time
 from typing import Optional,Literal
-
+import calendar
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException,Query
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from pymongo import MongoClient,ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP
@@ -26,6 +26,9 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
 db.attendance_logs.create_index([("date",-1),("emp_code",1)])
 db.attendance_logs.create_index([("status",1),("date",-1),("emp_code",1)])
+db.employees.create_index("emp_code",unique=True)
+db.employees.create_index([("department",1),("emp_code",1)])
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
@@ -106,19 +109,83 @@ def record_out(rec:dict)->dict:
         "history":history,
     }
 
+def employee_out(e:dict)->dict:
+    return {
+        "emp_code":e["emp_code"],
+        "name":e["name"],
+        "email":e["email"],
+        "department": e["department"],
+        "shift_start": e["shift_start"],
+        "shift_end": e["shift_end"],
+        "joined_on": e["joined_on"],
+        "created_at": to_ms(e.get("created_at")),
+    }
+
+def round_half_up(x,places:int=2)->float:
+    q=Decimal(1).scaleb(-places)
+    return float(Decimal(str(x)).quantize(q,rounding=ROUND_HALF_UP))
+
+def count_working_days(month:str,joined_on:str)->int:
+    year,mon=map(int,month.split("-"))
+    last_day=calendar.monthrange(year,mon)[1]
+    start=datetime(year,mon,1).date()
+    joined=datetime.fromisoformat(joined_on).date()
+    if joined>start:
+        start=joined
+    end=datetime(year,mon,last_day).date()
+    count=0
+    d=start
+    while d<=end:
+        if d.weekday()<5:
+            count+=1
+        d+=timedelta(days=1)
+    return count
+
+def employee_monthly_pipeline(emp_code:str,month:str)->list:
+    return[
+        {"$match":{
+            "emp_code":emp_code,
+            "date":{"$gte":f"{month}-01","$lte":f"{month}-31"},
+
+        }},
+       {"$addFields": {
+          "dow": {"$dayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}},
+       }},
+        {"$group":{
+            "_id":None,
+            "present_days":{"$sum":{"$cond":[
+                {"$and":[
+                   {"$in":["$status",["PRESENT","WFH","ON_DUTY"]]},
+                   {"$in":["$dow",[2,3,4,5,6]]},   
+                ]},
+                {"$cond":[{"$ifNull":["$half_day",False]},0.5,1]},
+                0,
+            ]}},
+            "leave_days":{"$sum":{"$cond":[{"$eq":["$status","LEAVE"]},1,0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes":{"$sum":{"$ifNull":["$late_minutes",0]}},
+            "total_overtime_minutes":{"$sum":{"$ifNull":["$overtime_minutes",0]}},
+        }},
+    ]
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str=Field(pattern=r"^EMP\d{4,6}$")
+    name: str=Field(min_length=1, max_length=100)
+    email: str=Field(max_length=120,pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str=Field(min_length=1,max_length=50)
+    shift_start: str =Field("09:30",pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field("18:30",pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    joined_on: str=Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
 
-
+    @model_validator(mode="after")
+    def check_fields(self):
+        if self.shift_start==self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        datetime.strptime(self.joined_on,"%Y-%m-%d")
+        return self
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[StrictInt] = Field(None, ge=100000000000, le=4102444800000)
@@ -146,14 +213,13 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
-    doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
+    doc=body.model_dump()
+    doc["created_at"]=datetime.now(IST).replace(microsecond=0)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409,"emp_code already exists")
+    return employee_out(doc)
 
 @app.get("/employees")
 def list_employees(
@@ -166,7 +232,10 @@ def list_employees(
         q["department"] = department
     skip = (page-1) * page_size
     total = db.employees.count_documents(q)
-    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code",1).skip(skip).limit(page_size))
+    items =[
+        employee_out(e)
+        for e in db.employees.find(q).sort("emp_code",1).skip(skip).limit(page_size)
+    ]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -369,6 +438,35 @@ def list_attendance(
         "page_size":page_size,
     }
 
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code:str,
+    month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp=db.employees.find_one({"emp_code":emp_code})
+    if not emp:
+        raise HTTPException(404,"employee not found")
+    working_days=count_working_days(month,emp["joined_on"])
+    rows=list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code,month)))
+    r=rows[0] if rows else {}
+
+    present_days=r.get("present_days",0)
+    attendance_pct=(
+        None if working_days==0
+        else round_half_up(Decimal(str(present_days))*100/working_days)
+    )
+
+    return {
+        "emp_code":emp_code,
+        "month":month,
+        "working_days":working_days,
+        "present_days":present_days,
+        "leave_days":r.get("leave_days",0),
+        "late_count":r.get("late_count",0),
+        "total_late_minutes":r.get("total_late_minutes",0),
+        "total_overtime_minutes":r.get("total_ovetime_minutes",0),
+        "attendance_pct":attendance_pct,
+    }
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
