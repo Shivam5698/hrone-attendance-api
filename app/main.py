@@ -24,7 +24,8 @@ load_dotenv()
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"),tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
-
+db.attendance_logs.create_index([("date",-1),("emp_code",1)])
+db.attendance_logs.create_index([("status",1),("date",-1),("emp_code",1)])
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
@@ -333,12 +334,15 @@ def regularize(emp_code:str,date:str,body:RegularizeIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[str] = Query(None,pattern=r"^\d{4}-\d{2}$"),
+    date_to: Optional[str] =Query(None,pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[Literal["PRESENT","WFH","ON_DUTY","ABSENT","LEAVE"]] = None,
+    page: int = Query(1,ge=1),
+    page_size: int = Query(20,ge=1,le=100),
 ):
+    if date_from and date_to and date_from>date_to:
+        raise HTTPException(422,"date_from must not be after date_to")
+    
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -350,14 +354,20 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
+    total=db.attendance_logs.count_documents(q)
+    cursor=(
+        db.attendance_logs.find(q)
+        .sort([("date",-1),("emp_code",1)])
+        .skip((page-1)*page_size)
+        .limit(page_size)
+    )
+    return{
+        "items":[record_out(d) for d in cursor],
+        "total":total,
+        "page":page,
+        "page_size":page_size,
+    }
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
