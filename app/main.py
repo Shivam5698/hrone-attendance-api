@@ -1,13 +1,4 @@
-"""
-Employee Attendance & Analytics API - STARTER
 
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
-"""
 import os
 import calendar
 import json
@@ -31,6 +22,7 @@ db.attendance_logs.create_index([("date",-1),("emp_code",1)])
 db.attendance_logs.create_index([("status",1),("date",-1),("emp_code",1)])
 db.employees.create_index("emp_code",unique=True)
 db.employees.create_index([("department",1),("emp_code",1)])
+db.employees.create_index([("joined_on",1)])
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -170,6 +162,89 @@ def employee_monthly_pipeline(emp_code:str,month:str)->list:
             "total_overtime_minutes":{"$sum":{"$ifNull":["$overtime_minutes",0]}},
         }},
     ]
+
+def department_summary_pipeline(month:str,department:Optional[str]=None)->list:
+    match={"joined_on":{"$lte":f"{month}-31"}}
+    if department:
+        match["department"]=department
+    is_present={"$in":["$logs.status",["PRESENT","WFH","ON_DUTY"]]}
+    has_hours={"$and":[is_present,{"$isNumber":"$logs.work_hours"}]}
+    return [
+        {"$match":match},
+        {"$lookup":{
+            "from":"attendance_logs",
+            "localField":"emp_code",
+            "foreignField":"emp_code",
+            "pipeline":[
+                {"$match":{"date":{"$gte":f"{month}-01","$lte":f"{month}-31"}}},
+            ],
+            "as":"logs",
+        }},
+        {"$unwind":{"path":"$logs","preserveNullAndEmptyArrays":True}},
+        {"$addFields":{
+            "dow":{"$dayOfWeek":{"$dateFromString":{"dateString":"$logs.date","format":"%Y-%m-%d"}}},
+        }},
+        {"$group":{
+            "_id":"$department",
+            "emp_codes":{"$addToSet":"$emp_code"},
+            "present_days":{"$sum":{"$cond":[
+                {"$and":[is_present,{"$in":["$dow",[2,3,4,5,6]]}]},
+                {"$cond":[{"$ifNull":["$logs.half_day",False]},0.5,1]},
+                0,
+            ]}},
+            "work_sum":{"$sum":{"$cond":[has_hours,"$logs.work_hours",0]}},
+            "work_n":{"$sum":{"$cond":[has_hours,1,0]}},
+            "late_count":{"$sum":{"$cond":[{"$gt":[{"$ifNull":["$logs.late_minutes",0]},0]},1,0]}},
+            "total_late_minutes":{"$sum":{"$ifNull":["$logs.late_minutes",0]}},
+            "leave_count":{"$sum":{"$cond":[{"$eq":["$logs.status","LEAVE"]},1,0]}},
+            "on_duty_count":{"$sum":{"$cond":[{"$eq":["$logs.status","ON_DUTY"]},1,0]}},
+        }},
+        {"$project":{
+            "_id":0,
+            "department":"$_id",
+            "headcount": {"$size": "$emp_codes"},      
+            "present_days":1,
+            "avg_work_hours":{"$cond":[{"$gt":["$work_n",0]},{"$divide":["$work_sum","$work_n"]},None]},
+            "late_count":1,
+            "total_late_minutes":1,
+            "leave_count":1,
+            "on_duty_count":1,
+        }},
+        {"$sort":{"department":1}},
+    ]
+
+def late_leaderboard_pipeline(month: str, limit: int, department: Optional[str] = None) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+    ]
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+    return pipeline
 
 STATUS_VALUES=("PRESENT","WFh","ON_DUTY","ABSENT","LEAVE")
 
@@ -522,6 +597,28 @@ def explain_endpoint(
             "pipeline":employee_monthly_pipeline(emp_code,month),
             "cursor":{},
         }
+    elif endpoint=="department_summary":
+        month=p.get("month")
+        if not month or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])",month):
+            raise HTTPException(422,"month (YYYY-MM) is required")
+        collection="employees"
+        cmd={
+            "aggregate":collection,
+            "pipeline":department_summary_pipeline(month,p.get("department")),
+            "cursor":{},
+         }
+    elif endpoint == "late_leaderboard":
+        month = p.get("month")
+        if not month or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            raise HTTPException(422, "month (YYYY-MM) is required")
+        limit = int_param(p, "limit", 10, 1, 50)
+        collection = "attendance_logs"
+        cmd = {
+            "aggregate": collection,
+            "pipeline": late_leaderboard_pipeline(month, limit, p.get("department")),
+            "cursor": {},
+        }
+    
     else:
         raise HTTPException(501,f"explain for {endpoint} is not implemented")
     result = db.command({"explain": cmd, "verbosity": "executionStats"})
@@ -531,7 +628,25 @@ def explain_endpoint(
         "explain":json.loads(json_util.dumps(result)),
     }
 
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month:str=Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department:Optional[str]=None,
+):
+    rows=list(db.employees.aggregate(department_summary_pipeline(month,department)))
+    for r in rows:
+        if r["avg_work_hours"] is not None:
+            r["avg_work_hours"]=round_half_up(r["avg_work_hours"])
+    return {"month":month,"items":rows}
 
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    rows = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
+    return {"month": month, "items": rows} 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out

@@ -5,3 +5,6 @@ sample_seed.py
 sample_data/
 check.py
 race_test.py
+check_explain.py
+check_leaderbord.py
+check_summary.py
