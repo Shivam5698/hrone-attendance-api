@@ -1,11 +1,11 @@
 Employee Attendance and Analytics API
-=-----------------------------------=
+#-----------------------------------#
 
 This is a backend service for tracking employee attendance and generating related analytics. It relies on FastAPI and MongoDB. To keep the project structure simple, all the application code is housed within a single file: `app/main.py`.
 
 
 Setup Instructions
-=-----------------------------------=
+#-----------------------------------#
 
 Before starting, ensure your system has the following installed:
 - Python 3.11 or a newer version.
@@ -44,7 +44,7 @@ Note: Database indexes are created automatically when the application starts. Yo
 
 
 Available Endpoints
-=-----------------------------------=
+#-----------------------------------#
 
 The following API routes are fully implemented and working:
 
@@ -66,7 +66,7 @@ Analytics & Admin Tools:
 
 
 Pending Features
-=-----------------------------------=
+#-----------------------------------#
 
 The following items are missing or not yet fully developed:
 - `GET /analytics/departments/{department}/trend`
@@ -74,7 +74,7 @@ The following items are missing or not yet fully developed:
 
 
 Things to Keep in Mind
-=-----------------------------------=
+#-----------------------------------#
 
 There are a couple of known limitations you should be aware of while using the API:
 
