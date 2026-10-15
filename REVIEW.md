@@ -2,9 +2,9 @@
 
 Defects found in the starter `app/main.py`. Each one was reproduced with a concrete input before it was fixed.
 
-=-----------------------------------=
+#-----------------------------------#
 Bug Fixes & Observations
-=-----------------------------------=
+#-----------------------------------#
 
 I spent some time going through the code and found quite a few logic bugs and edge cases. Here is a breakdown of what I fixed:
 
@@ -29,9 +29,9 @@ The `GET /attendance` route was a ticking time bomb for memory. It loaded every 
 
 Lastly, our `MongoClient` wasn't timezone aware. Pulling naive dates from Mongo and subtracting them from aware dates was causing random 500 errors. Adding `tz_aware=True` to the client fixed it. I also created a `record_out` helper because endpoints were leaking MongoDB `_id`s and raw datetimes instead of the required epoch milliseconds.
 
-=-----------------------------------=
+#-----------------------------------#
 Notes & Things Kept As-Is
-=-----------------------------------=
+#-----------------------------------#
 
 * I noticed that `GET /employees?department=...` acts as an exact, case-sensitive match. Since the OpenAPI contract didn't explicitly ask for case-insensitivity, I decided to leave it exactly as it is.
 * The three original time calculation helper functions actually proved to be pretty reusable once their logic bugs were patched up. Instead of rewriting them from scratch, I just kept them in place.
